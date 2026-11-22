@@ -207,3 +207,152 @@ int run_batch_read_benchmark(const std::string& filepath, int num_parsers, Worke
     cfg.num_parsers = num_parsers;
     return run_worker(cfg, &out_metrics, read_fn);
 }
+namespace {
+
+const char* state_to_str(WorkerState st) {
+    switch (st) {
+        case WorkerState::STARTING: return "INICIANDO";
+        case WorkerState::RUNNING:  return "ACTIVO";
+        case WorkerState::PAUSED:   return "PAUSADO";
+        case WorkerState::FINISHED: return "FINALIZADO";
+        case WorkerState::ERROR:    return "ERROR";
+        case WorkerState::DEAD:     return "MUERTO (SIG)";
+        default:                    return "DESCONOCIDO";
+    }
+}
+
+} // namespace
+
+bool export_metrics_csv(const std::string& csv_path, SharedRegion* shm, int num_workers) {
+    if (!shm) return false;
+    int fd = open(csv_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return false;
+
+    std::vector<WorkerMetrics> snap(num_workers);
+    sem_wait(&shm->sem);
+    for (int i = 0; i < num_workers; ++i) snap[i] = shm->workers[i];
+    sem_post(&shm->sem);
+
+    std::string out = "archivo,pid,estado,peticiones_totales,mal_formadas,bytes_totales,http_2xx,http_3xx,http_4xx,http_5xx,req_por_seg,tiempo_s,minor_faults,major_faults,vm_rss_kb\n";
+    for (int i = 0; i < num_workers; ++i) {
+        const auto& w = snap[i];
+        char row[1024];
+        snprintf(row, sizeof(row),
+                 "\"%s\",%d,%s,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%.2f,%.4f,%ld,%ld,%ld\n",
+                 w.filename, w.pid, state_to_str(w.state),
+                 w.total_requests, w.malformed_lines, w.total_bytes,
+                 w.status_2xx, w.status_3xx, w.status_4xx, w.status_5xx,
+                 w.requests_per_sec, w.elapsed_seconds,
+                 w.minor_faults, w.major_faults, w.vm_rss_kb);
+        out += row;
+    }
+
+    ssize_t written = write(fd, out.data(), out.size());
+    close(fd);
+    return written == static_cast<ssize_t>(out.size());
+}
+
+void run_ncurses_ui(SharedRegion* shm,
+                    int num_workers,
+                    std::atomic<bool>& global_stop,
+                    std::atomic<bool>& global_pause,
+                    const std::string& mode_str,
+                    int threads_per_worker) {
+    initscr();
+    cbreak();
+    noecho();
+    curs_set(0);
+    keypad(stdscr, TRUE);
+    nodelay(stdscr, TRUE);
+
+    if (has_colors()) {
+        start_color();
+        init_pair(1, COLOR_CYAN, COLOR_BLACK);
+        init_pair(2, COLOR_GREEN, COLOR_BLACK);
+        init_pair(3, COLOR_YELLOW, COLOR_BLACK);
+        init_pair(4, COLOR_RED, COLOR_BLACK);
+    }
+
+    int selected_worker = 0;
+    std::string status_banner = "Listo. Controles: [p] Pausar/Reanudar | [e] Exportar CSV | [Tab] Cambiar archivo | [q] Salir";
+    std::vector<WorkerMetrics> snap(num_workers);
+    struct timespec sleep_ts{0, 200000000L};
+
+    while (!global_stop.load(std::memory_order_relaxed)) {
+        int ch = getch();
+        if (ch == 'q' || ch == 'Q') {
+            global_stop.store(true, std::memory_order_relaxed);
+            break;
+        } else if (ch == 'p' || ch == 'P') {
+            bool cur = global_pause.load(std::memory_order_relaxed);
+            global_pause.store(!cur, std::memory_order_relaxed);
+            status_banner = !cur ? "PAUSADO por usuario. Presione [p] para reanudar."
+                                 : "REANUDADO. Procesando registros...";
+        } else if (ch == 'e' || ch == 'E') {
+            std::string csv_file = "logpulse_reporte_" + std::to_string(time(nullptr)) + ".csv";
+            if (export_metrics_csv(csv_file, shm, num_workers)) {
+                status_banner = "Exportado exitosamente a: " + csv_file;
+            } else {
+                status_banner = "Error al exportar CSV.";
+            }
+        } else if (ch == '\t' || ch == KEY_RIGHT) {
+            selected_worker = (selected_worker + 1) % num_workers;
+        } else if (ch == KEY_LEFT) {
+            selected_worker = (selected_worker - 1 + num_workers) % num_workers;
+        } else if (ch == KEY_RESIZE) {
+            resize_term(0, 0);
+        }
+
+        sem_wait(&shm->sem);
+        for (int i = 0; i < num_workers; ++i) snap[i] = shm->workers[i];
+        sem_post(&shm->sem);
+
+        erase();
+        int max_y, max_x;
+        getmaxyx(stdscr, max_y, max_x);
+        (void)max_x;
+
+        attron(A_BOLD | COLOR_PAIR(1));
+        mvprintw(0, 1, "LOGPULSE - Analizador Concurrente de Logs | Modo: %s | Hilos/Archivo: %d",
+                 mode_str.c_str(), threads_per_worker);
+        attroff(A_BOLD | COLOR_PAIR(1));
+
+        int row = 2;
+        mvprintw(row++, 1, "PROCESOS TRABAJADORES (%d):", num_workers);
+        for (int i = 0; i < num_workers && row < max_y - 12; ++i) {
+            const auto& w = snap[i];
+            if (i == selected_worker) attron(A_REVERSE);
+            mvprintw(row++, 2, "[%d] PID:%-6d | %-11s | Reqs:%-8lu | ErrFmt:%-5lu | %.1f req/s | %s",
+                     i + 1, w.pid, state_to_str(w.state),
+                     w.total_requests, w.malformed_lines, w.requests_per_sec, w.filename);
+            if (i == selected_worker) attroff(A_REVERSE);
+        }
+
+        const auto& cur = snap[selected_worker];
+        row++;
+        if (row < max_y - 8) {
+            attron(A_BOLD);
+            mvprintw(row++, 1, "DETALLE ARCHIVO [%d]: %s (Tiempo: %.2fs | VmRSS: %ld KB | MinFlt: %ld)",
+                     selected_worker + 1, cur.filename, cur.elapsed_seconds, cur.vm_rss_kb, cur.minor_faults);
+            attroff(A_BOLD);
+            mvprintw(row++, 2, "HTTP 2xx: %-8lu | HTTP 3xx: %-8lu | HTTP 4xx: %-8lu | HTTP 5xx: %-8lu | Bytes: %lu",
+                     cur.status_2xx, cur.status_3xx, cur.status_4xx, cur.status_5xx, cur.total_bytes);
+            row++;
+            mvprintw(row++, 2, "TOP IPs (Top 5)                      | TOP URLs SOLICITADAS (Top 5)         | TOP URLs LENTAS (Prom. s)");
+            for (int k = 0; k < 5 && row < max_y - 3; ++k) {
+                mvprintw(row++, 2, "%-20s (%-7lu)     | %-24s (%-7lu) | %-20s (%.3fs)",
+                         cur.top_ips[k].count > 0 ? cur.top_ips[k].ip : "-", cur.top_ips[k].count,
+                         cur.top_urls[k].count > 0 ? cur.top_urls[k].url : "-", cur.top_urls[k].count,
+                         cur.top_slow_urls[k].count > 0 ? cur.top_slow_urls[k].url : "-", cur.top_slow_urls[k].avg_time);
+            }
+        }
+
+        attron(A_BOLD | COLOR_PAIR(3));
+        mvprintw(max_y - 1, 1, "%s", status_banner.c_str());
+        attroff(A_BOLD | COLOR_PAIR(3));
+
+        refresh();
+        nanosleep(&sleep_ts, nullptr);
+    }
+    endwin();
+}
